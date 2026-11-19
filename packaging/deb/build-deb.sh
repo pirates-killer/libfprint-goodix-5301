@@ -73,6 +73,6 @@ if [ "$1" = configure ]; then
 fi
 POST
 chmod 755 "$R/DEBIAN/postinst"
-NAME="libfprint-2-2_${UPVER}+goodixmilanf${PKGREV}~${SUFFIX}_${ARCH}.deb"
+NAME="libfprint-2-2_${UPVER}+goodixmilanf${PKGREV}.${SUFFIX}_${ARCH}.deb"   # no "~": GitHub assets drop it
 dpkg-deb --root-owner-group -Zxz --build "$R" "$OUT/$NAME" >/dev/null
 echo "$OUT/$NAME"

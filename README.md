@@ -28,8 +28,8 @@ this driver, so `fprintd` keeps working.
 
 | Distribution | Package | Install |
 |---|---|---|
-| Ubuntu 24.04 (should also work on 24.04-based distros such as Linux Mint 22 and Pop!_OS 24.04) | `libfprint-2-2_…~ubuntu24.04_amd64.deb` | `sudo apt install ./libfprint-2-2_*~ubuntu24.04_amd64.deb fprintd libpam-fprintd` |
-| Debian 12 | `libfprint-2-2_…~deb12_amd64.deb` | `sudo apt install ./libfprint-2-2_*~deb12_amd64.deb fprintd libpam-fprintd` |
+| Ubuntu 24.04 (should also work on 24.04-based distros such as Linux Mint 22 and Pop!_OS 24.04) | `libfprint-2-2_…ubuntu24.04_amd64.deb` | `sudo apt install ./libfprint-2-2_*ubuntu24.04_amd64.deb fprintd libpam-fprintd` |
+| Debian 12 | `libfprint-2-2_…deb12_amd64.deb` | `sudo apt install ./libfprint-2-2_*deb12_amd64.deb fprintd libpam-fprintd` |
 | Fedora 45 | `libfprint-1.94.100-100.goodixmilanf1.fc45.x86_64.rpm` | `sudo dnf install ./libfprint-*.fc45.x86_64.rpm fprintd fprintd-pam` |
 | Arch, Omarchy, Manjaro, EndeavourOS | `libfprint-goodixmilanf-…pkg.tar.zst` | `sudo pacman -U libfprint-goodixmilanf-*.pkg.tar.zst` (or build it, below) |
 

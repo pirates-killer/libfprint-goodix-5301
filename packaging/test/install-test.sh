@@ -9,7 +9,7 @@ case "$ID" in
     apt-get update -qq
     apt-get install -y -qq fprintd libpam-fprintd >/dev/null 2>&1
     echo "stock: $(dpkg-query -W -f='${Package} ${Version}' libfprint-2-2)"
-    f=$(ls /share/dist/*~$( [ "$ID" = debian ] && echo deb$VERSION_ID || echo ubuntu$VERSION_ID )_*.deb)
+    f=$(ls /share/dist/*$( [ "$ID" = debian ] && echo deb$VERSION_ID || echo ubuntu$VERSION_ID )_*.deb)
     apt-get install -y -qq "$f" 2>&1 | grep -viE "^(debconf|Selecting|Preparing|Unpacking|Setting up|Processing|\(Reading)" || true
     echo "now:   $(dpkg-query -W -f='${Package} ${Version} ${Status}' libfprint-2-2)"
     echo "fprintd: $(dpkg-query -W -f='${Version} ${Status}' fprintd)"

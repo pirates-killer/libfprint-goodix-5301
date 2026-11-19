@@ -17,7 +17,7 @@ lsusb | grep 27c6:5301
 > **Status: works, early.** Tested on one laptop (Dell Inspiron 5575, Arch /
 > Omarchy): enrolling and verifying through fprintd and libfprint's example
 > programs, plus Omarchy's fingerprint setup for sudo, polkit and the lock
-> screen. Please open an issue with your laptop model if it works (or
+> screen (unlocking the Hyprland lock screen confirmed). Please open an issue with your laptop model if it works (or
 > doesn't) for you.
 
 ## Install

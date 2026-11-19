@@ -22,7 +22,32 @@ lsusb | grep 27c6:5301
 
 ## Install
 
-### Arch Linux, Omarchy, Manjaro, EndeavourOS
+Prebuilt packages are on the [Releases page](https://github.com/pirates-killer/libfprint-goodix-5301/releases).
+Each one replaces the distribution's libfprint with upstream libfprint plus
+this driver, so `fprintd` keeps working.
+
+| Distribution | Package | Install |
+|---|---|---|
+| Ubuntu 24.04 (should also work on 24.04-based distros such as Linux Mint 22 and Pop!_OS 24.04) | `libfprint-2-2_…~ubuntu24.04_amd64.deb` | `sudo apt install ./libfprint-2-2_*~ubuntu24.04_amd64.deb fprintd libpam-fprintd` |
+| Debian 12 | `libfprint-2-2_…~deb12_amd64.deb` | `sudo apt install ./libfprint-2-2_*~deb12_amd64.deb fprintd libpam-fprintd` |
+| Fedora 45 | `libfprint-1.94.100-100.goodixmilanf1.fc45.x86_64.rpm` | `sudo dnf install ./libfprint-*.fc45.x86_64.rpm fprintd fprintd-pam` |
+| Arch, Omarchy, Manjaro, EndeavourOS | `libfprint-goodixmilanf-…pkg.tar.zst` | `sudo pacman -U libfprint-goodixmilanf-*.pkg.tar.zst` (or build it, below) |
+
+Then restart fprintd so it loads the new library: `sudo systemctl stop fprintd`.
+
+Each package was built and install-tested next to the distribution's own
+`fprintd` on a clean system: it replaces the stock libfprint, fprintd links
+against it, and a normal `apt upgrade` / `dnf upgrade` keeps it. Only the
+Arch build has been used with the actual reader so far.
+
+**Keeping it installed:** the package version is higher than the
+distribution's, so updates leave it alone. If your distribution ever ships a
+newer libfprint, the update would replace it and the reader would stop
+working until you install a newer build from here. To prevent that:
+`sudo apt-mark hold libfprint-2-2` (Debian/Ubuntu) or
+`sudo dnf versionlock add libfprint` (Fedora, needs `python3-dnf-plugin-versionlock`).
+
+### Arch: build from source
 
 ```
 git clone https://github.com/pirates-killer/libfprint-goodix-5301
@@ -34,15 +59,22 @@ The package replaces `libfprint` / `libfprint-git` (it provides both), so
 `fprintd` and Omarchy's fingerprint setup keep working. It builds upstream
 libfprint from source with the driver patch applied, and pulls in OpenCV.
 
-Then restart fprintd so it loads the new library:
+### Debian, Ubuntu, Fedora: build the package yourself
+
+On the release you want to install on (as root, or in a container of that
+release):
 
 ```
-sudo systemctl stop fprintd
+git clone https://github.com/pirates-killer/libfprint-goodix-5301
+sudo sh libfprint-goodix-5301/packaging/deb/build-deb.sh .      # Debian / Ubuntu
+sudo sh libfprint-goodix-5301/packaging/rpm/build-rpm.sh .      # Fedora
 ```
 
-### Other distributions (build from source, untested)
+### Any other distribution: build from source
 
-You need libfprint's build dependencies plus OpenCV and a C++ compiler.
+You need libfprint's build dependencies plus OpenCV (4.4 or newer) and a C++
+compiler. These dependency lists were checked on Debian 12, Ubuntu 24.04
+and Fedora 45:
 
 - Debian / Ubuntu: `sudo apt install git meson ninja-build gcc g++ pkg-config libglib2.0-dev libgusb-dev libgudev-1.0-dev libpixman-1-dev libssl-dev libopencv-dev udev`
 - Fedora: `sudo dnf install git meson gcc gcc-c++ glib2-devel libgusb-devel libgudev-devel pixman-devel openssl-devel opencv-devel systemd-devel`
@@ -59,9 +91,9 @@ sudo install -m644 /path/to/libfprint-goodix-5301/udev/61-goodixmilanf.rules /us
 sudo udevadm control --reload && sudo systemctl stop fprintd
 ```
 
-This overwrites your distribution's libfprint, and a system update will put
-the stock one back (without the driver). The patch should also apply to
-other recent libfprint versions (1.94.x).
+This writes over your distribution's libfprint outside the package manager,
+so a system update can put the stock one back. Prefer a package where you
+can. The patch should also apply to other recent libfprint versions (1.94.x).
 
 ## Set up fingerprint login
 
@@ -125,6 +157,7 @@ erase and key commands.
 
 ## How it works
 
+- `packaging/` — .deb/.rpm build scripts and the rootless distro test harness.
 - `patches/` — the libfprint driver (`libfprint/drivers/goodixmilanf/`), as
   one patch against upstream libfprint.
 - `docs/PROTOCOL.md` — the USB protocol: framing, init sequence, OTP

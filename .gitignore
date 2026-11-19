@@ -8,3 +8,4 @@ arch/pkg/
 arch/libfprint/
 arch/*.pkg.tar.*
 __pycache__/
+dist/

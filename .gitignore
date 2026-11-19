@@ -1,0 +1,10 @@
+# never commit fingerprint data or build output
+gx-captures/
+*.pgm
+*.png
+*.variant
+arch/src/
+arch/pkg/
+arch/libfprint/
+arch/*.pkg.tar.*
+__pycache__/

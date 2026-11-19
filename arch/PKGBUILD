@@ -1,0 +1,42 @@
+# libfprint with the goodixmilanf driver for the Goodix 27c6:5301
+# ("Milan F") fingerprint reader. Replaces libfprint / libfprint-git.
+#
+# Build:   makepkg -si
+pkgname=libfprint-goodixmilanf
+_commit=8b6e4e39bee58de2774222e3730269def470b157   # upstream master, v1.94.100-11
+pkgver=1.94.100.r11.g8b6e4e3
+pkgrel=1
+pkgdesc="libfprint with the Goodix Milan F (27c6:5301) fingerprint driver"
+arch=(x86_64 aarch64)
+url="https://github.com/pirates-killer/libfprint-goodix-5301"
+license=(LGPL-2.1-or-later)
+depends=(gcc-libs glib2 glibc libgudev libgusb openssl pixman opencv)
+makedepends=(git meson glib2-devel)
+provides=("libfprint=${pkgver}" "libfprint-git=1:${pkgver}" "libfprint-2.so=2-64")
+conflicts=(libfprint libfprint-git)
+source=("libfprint::git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=${_commit}"
+        "0001-goodixmilanf-Add-driver-for-Goodix-Milan-F-27c6-5301.patch"
+        "61-goodixmilanf.rules")
+sha256sums=('SKIP'
+            '227b734a24e5a06af502745199ac729a0a85e606c57471156bff319aafafaeb0'
+            '2e4a41571ea9648c0e9c056060c353c16c5aa7068968d9d0cbf43529f21646ba')
+
+prepare() {
+  cd libfprint
+  git apply "$srcdir/0001-goodixmilanf-Add-driver-for-Goodix-Milan-F-27c6-5301.patch"
+}
+
+build() {
+  arch-meson libfprint build \
+    -D doc=false \
+    -D gtk-examples=false \
+    -D installed-tests=false \
+    -D introspection=false \
+    -D udev_hwdb=enabled
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 61-goodixmilanf.rules "$pkgdir/usr/lib/udev/rules.d/61-goodixmilanf.rules"
+}

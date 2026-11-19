@@ -1,0 +1,1687 @@
+From 100d7043a6dd7444384b9d5c6a6198152e142b48 Mon Sep 17 00:00:00 2001
+From: pirates-killer <5260852+pirates-killer@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:46:25 +0800
+Subject: [PATCH] goodixmilanf: Add driver for Goodix Milan F (27c6:5301)
+
+The Goodix 27c6:5301 reader (GF5288-family sensor, chip ID 0x2202,
+108x88 px, behind an HT32 MCU running "HT_APP" firmware) ships in
+laptops such as the Dell Inspiron 5575. It enumerates as a CDC-ACM
+device and speaks the Goodix message-pack protocol without TLS.
+
+The protocol, sensor config, OTP calibration and frame descrambling
+(16-bit LFSR XOR stream + CRC32/MPEG-2) were reverse engineered from the
+Goodix Windows driver milanFusb.dll 1.0.33.600 for interoperability and
+verified against the device.
+
+The sensor is too small for NBIS/bozorth3 (0-2 minutiae per image), so
+the driver is an FpDevice that matches on the host with SIGFM (SIFT +
+geometric consistency, based on the goodix-fp-linux-dev implementation)
+and stores the enrolled samples in a raw print. Finger detection polls
+frames against an adaptive baseline that repairs itself if it was taken
+with a finger on the sensor. Requires OpenCV.
+---
+ data/autosuspend.hwdb                         |    6 +-
+ libfprint/drivers/goodixmilanf/goodixmilanf.c | 1308 +++++++++++++++++
+ libfprint/drivers/goodixmilanf/sigfm.cpp      |  202 +++
+ libfprint/drivers/goodixmilanf/sigfm.h        |   37 +
+ libfprint/fprint-list-udev-hwdb.c             |    1 -
+ libfprint/meson.build                         |    5 +
+ meson.build                                   |    8 +
+ 7 files changed, 1565 insertions(+), 2 deletions(-)
+ create mode 100644 libfprint/drivers/goodixmilanf/goodixmilanf.c
+ create mode 100644 libfprint/drivers/goodixmilanf/sigfm.cpp
+ create mode 100644 libfprint/drivers/goodixmilanf/sigfm.h
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 802854b0..3d4d1dd9 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -217,6 +217,11 @@ usb:v10A5p9B24*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver goodixmilanf
++usb:v27C6p5301*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver goodixmoc
+ usb:v27C6p5840*
+ usb:v27C6p6014*
+@@ -522,7 +527,6 @@ usb:v27C6p5120*
+ usb:v27C6p5125*
+ usb:v27C6p5201*
+ usb:v27C6p521D*
+-usb:v27C6p5301*
+ usb:v27C6p530C*
+ usb:v27C6p532D*
+ usb:v27C6p5335*
+diff --git a/libfprint/drivers/goodixmilanf/goodixmilanf.c b/libfprint/drivers/goodixmilanf/goodixmilanf.c
+new file mode 100644
+index 00000000..fd5dddfc
+--- /dev/null
++++ b/libfprint/drivers/goodixmilanf/goodixmilanf.c
+@@ -0,0 +1,1308 @@
++/*
++ * Goodix "Milan F" (27c6:5301, GF5288 sensor behind an HT32 "HT_APP" MCU)
++ * image driver for libfprint.
++ *
++ * Protocol reverse engineered from the Goodix Windows UMDF driver
++ * milanFusb.dll 1.0.33.600 (its PDB is public on the Windows Update
++ * Catalog) and verified against the device. Framing is the Goodix
++ * "message pack" protocol without TLS:
++ *
++ *   message = cmd | size LE16 (= len(payload) + 1) | payload | checksum
++ *   cmd     = category << 4 | command << 1
++ *   csum    = 0xAA - sum(cmd .. payload), or 0x88 for "none"
++ *
++ * sent in 64-byte packets; packets after the first start with (cmd | 1).
++ * The MCU pads every IN packet to 64 bytes. Every host message is ACKed
++ * with b0 03 00 <cmd> <flags> <csum>; flags bit 1 = "config lost".
++ *
++ * Images (cmd 0x20, payload 01 00) arrive as 108 x 88 12-bit pixels packed
++ * 4-in-6 bytes, XOR-scrambled with a 16-bit LFSR stream (seed 0x12345678),
++ * followed by a CRC32/MPEG-2.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define FP_COMPONENT "goodixmilanf"
++
++#include "drivers_api.h"
++#include "sigfm.h"
++#include <math.h>
++#include <string.h>
++
++#define EP_OUT            (0x03 | FPI_USB_ENDPOINT_OUT)
++#define EP_IN             (0x01 | FPI_USB_ENDPOINT_IN)
++#define CTRL_IFACE        0
++#define DATA_IFACE        1
++#define CHUNK             64
++
++#define IMG_W             108
++#define IMG_H             88
++#define NPIX              (IMG_W * IMG_H)
++#define RAW_PIX_BYTES     (NPIX * 3 / 2)              /* 14256 */
++#define MATCH_THRESHOLD   40      /* SIGFM score; impostors scored <= 18 in tests */
++#define MIN_KEYPOINTS     25
++#define ENROLL_STAGES     12
++#define PRINT_VERSION     1
++
++#define ACK_TIMEOUT       500
++#define REPLY_TIMEOUT     2000
++#define POLL_DELAY        60
++
++#define CHIP_ID_MILANF    0x2202
++
++/* Variance of (baseline - frame); idle ~15, finger 4e4..1.4e5 */
++#define FINGER_ON_VAR     2500.0
++#define FINGER_OFF_VAR    600.0
++#define IDLE_VAR          200.0
++#define FRAMES_PER_SCAN   3
++#define BASE_FRAMES       3
++/* A finger always lowers the readings (by 117..661 over 54 test touches).
++ * Frames clearly brighter than the baseline mean the baseline itself was
++ * taken with a finger on the sensor. */
++#define FINGER_MIN_SHIFT  40.0
++#define REBASE_SHIFT      (-80.0)
++#define REBASE_FRAMES     3
++
++/* Commands (cmd byte) */
++#define CMD_NOP           0x00
++#define CMD_GET_IMAGE     0x20
++#define CMD_READ_REG      0x82
++#define CMD_UPLOAD_CFG    0x90
++#define CMD_RESET         0xa2
++#define CMD_READ_OTP      0xa6
++#define CMD_FW_VERSION    0xa8
++#define CMD_ACK           0xb0
++
++/* g_general[0] in milanFusb.dll: sensor config for chip 0x2202 */
++static const guint8 milanf_config[256] = {
++  0x08, 0x11, 0x54, 0x65, 0x24, 0x89, 0x24, 0xad, 0x1c, 0xc9, 0x1c, 0xe5,
++  0x04, 0xe9, 0x04, 0xed, 0x13, 0xba, 0x00, 0x01, 0x00, 0xca, 0x00, 0x07,
++  0x00, 0x84, 0x00, 0x80, 0x81, 0x86, 0x00, 0x80, 0x8c, 0x88, 0x00, 0x80,
++  0x97, 0x8a, 0x00, 0x80, 0xb0, 0x8c, 0x00, 0x80, 0x86, 0x8e, 0x00, 0x80,
++  0x8c, 0x90, 0x00, 0x80, 0xa0, 0x92, 0x00, 0x80, 0xb3, 0x94, 0x00, 0x80,
++  0x84, 0x96, 0x00, 0x80, 0x88, 0x98, 0x00, 0x80, 0xa0, 0x9a, 0x00, 0x80,
++  0xb8, 0x56, 0x00, 0x08, 0x28, 0x58, 0x00, 0x48, 0x00, 0x70, 0x00, 0x01,
++  0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34, 0x12, 0x26, 0x00, 0x00,
++  0x12, 0xd0, 0x00, 0x00, 0x00, 0x20, 0x01, 0x02, 0x04, 0x20, 0x00, 0x10,
++  0x40, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01,
++  0x04, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00, 0x00, 0x2a, 0x02, 0x00,
++  0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x82, 0x04, 0x20, 0x00, 0x10,
++  0x40, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01,
++  0x04, 0x5c, 0x00, 0x00, 0x01, 0x28, 0x02, 0x00, 0x00, 0x2a, 0x02, 0x00,
++  0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x08, 0x04, 0x22, 0x00, 0x10,
++  0x08, 0x80, 0x00, 0x01, 0x00, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x08,
++  0x04, 0x5c, 0x00, 0x80, 0x00, 0x50, 0x00, 0x01, 0x05, 0x52, 0x00, 0x08,
++  0x00, 0x54, 0x00, 0x10, 0x01, 0x28, 0x02, 0x00, 0x00, 0x2a, 0x02, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00,
++};
++
++struct _FpiDeviceGoodixMilanF
++{
++  FpDevice      parent;
++
++  /* current command transaction */
++  guint8        tx_cmd;
++  guint8       *tx_buf;
++  gsize         tx_len;
++  gboolean      tx_want_reply;
++  guint8        ack_flags;
++  guint8        rx_cmd;
++  guint8       *rx_buf;        /* full message: cmd, size, payload, csum */
++  gsize         rx_total;
++  gsize         rx_have;
++
++  guint8        config[256];
++
++  /* capture loop */
++  int           phase;          /* TOUCH_* */
++  GPtrArray    *enroll_infos;   /* GxSigfm* */
++  GError       *action_error;
++  gint64        busy_since;
++  guint16      *frame;         /* NPIX, heap: GObject instances must be < 64 KiB */
++  gdouble      *base;
++  guint         base_frames;
++  guint         scan_frames;
++  guint         dbg_frames;
++  guint         bright_frames;
++  gdouble      *rebase;         /* NPIX accumulator */
++  gboolean      seen_clear;     /* sensor seen empty since activation */
++  guint         dump_seq;
++  gdouble       best_var;
++  gdouble      *best_diff;
++};
++
++G_DECLARE_FINAL_TYPE (FpiDeviceGoodixMilanF, fpi_device_goodixmilanf, FPI,
++                      DEVICE_GOODIXMILANF, FpDevice);
++G_DEFINE_TYPE (FpiDeviceGoodixMilanF, fpi_device_goodixmilanf, FP_TYPE_DEVICE);
++
++/* ------------------------------------------------------------------ */
++/* Helpers                                                             */
++
++static guint8
++msg_checksum (const guint8 *data, gsize len)
++{
++  guint8 s = 0;
++
++  for (gsize i = 0; i < len; i++)
++    s += data[i];
++  return (guint8) (0xaa - s);
++}
++
++static const guint8 *
++reply_payload (FpiDeviceGoodixMilanF *self, gsize *len)
++{
++  *len = self->rx_total - 4;
++  return self->rx_buf + 3;
++}
++
++static guint32
++crc32_mpeg2 (const guint8 *data, gsize len)
++{
++  guint32 c = 0xffffffff;
++
++  for (gsize i = 0; i < len; i++)
++    {
++      c ^= (guint32) data[i] << 24;
++      for (int b = 0; b < 8; b++)
++        c = (c & 0x80000000) ? (c << 1) ^ 0x04c11db7 : (c << 1);
++    }
++  return c;
++}
++
++/* Literal port of lfsr_prbs() from milanFusb.dll */
++static guint16
++lfsr_prbs (guint32 p, guint32 *next)
++{
++  guint32 u2 = (p >> 1) ^ p;
++  /* same precedence in C and Python: >> then & then ^ then | */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wparentheses"
++  guint32 u1 = ((((((((p >> 0xF & 0x2000 | p & 0x1000000) >> 1 | p & 0x20000) >> 2 |
++                    p & 0x1000) >> 3 | (p >> 7 ^ p) & 0x80000) >> 1 |
++                  (p >> 0xF ^ p) & 0x4000) >> 2 | p & 0x2000) >> 1 |
++                (p >> 0xE ^ p) & 0x200) >> 1 | u2 & 0x40 | p & 0x20) >> 1;
++#pragma GCC diagnostic pop
++  guint8 lo8 = (guint8) ((u1 & 0xff) |
++                         ((((p >> 0x14) & 0xff) ^ ((p & 0xff) * 2)) & 4) |
++                         (p & 1));
++  guint16 w;
++
++  *next = ((((u2 >> 0x1e) ^ ((p >> 10) & 0xff) ^ (p & 0xff)) << 0x1f) | (p >> 1));
++
++  w = (guint16) (((u1 >> 8) & 0xffff) |
++                 ((((p >> 0x18) & 0xff) ^ (((p << 3) >> 8) & 0xffff)) & 0x40) |
++                 ((((p >> 0x11) & 0xffff) ^ (p & 0xffff)) & 8) |
++                 (((((p << 6) >> 8) & 0xffff) ^ (((p >> 7) >> 8) & 0xffff)) & 1) |
++                 ((((p & 0x100) << 7) >> 8) & 0xffff));
++  return (guint16) (w + lo8 * 0x100);
++}
++
++static void
++prbs_decrypt (guint8 *data, gsize len)
++{
++  guint32 st = 0x12345678;
++
++  for (gsize i = 0; i + 1 < len; i += 2)
++    {
++      guint16 w = lfsr_prbs (st, &st);
++      guint16 v = (guint16) (data[i] | data[i + 1] << 8) ^ w;
++
++      data[i] = v & 0xff;
++      data[i + 1] = v >> 8;
++    }
++}
++
++static void
++decode_12bit (const guint8 *d, guint16 *px)
++{
++  for (gsize i = 0, o = 0; o + 3 < NPIX; i += 6, o += 4)
++    {
++      px[o + 0] = ((d[i + 0] & 0xf) << 8) | d[i + 1];
++      px[o + 1] = (d[i + 3] << 4) | (d[i + 0] >> 4);
++      px[o + 2] = ((d[i + 5] & 0xf) << 8) | d[i + 2];
++      px[o + 3] = (d[i + 4] << 4) | (d[i + 5] >> 4);
++    }
++}
++
++static void
++config_fix_checksum (guint8 *cfg)
++{
++  guint16 s = 0xa5a5;
++
++  for (int i = 0; i < 0xfe; i += 2)
++    s += cfg[i] | cfg[i + 1] << 8;
++  s = (guint16) (0x10000 - s);
++  cfg[0xfe] = s & 0xff;
++  cfg[0xff] = s >> 8;
++}
++
++/* Walk one config section (table entry at cfg[idx], cfg[idx+1]) for a tag */
++static void
++config_patch_tag (guint8 *cfg, int idx, guint16 tag, int lo, int hi)
++{
++  int base = cfg[idx], size = cfg[idx + 1];
++  int i = base + 2;
++
++  if (!size)
++    return;
++  for (int n = ((size - 1) >> 2) + 1; n > 0 && i + 1 < 256; n--, i += 4)
++    if ((cfg[i - 2] | cfg[i - 1] << 8) == tag)
++      {
++        if (lo >= 0)
++          cfg[i] = lo;
++        if (hi >= 0)
++          cfg[i + 1] = hi;
++      }
++}
++
++/* CheckTcodeAndDiff() from the Windows driver */
++static void
++build_config (FpiDeviceGoodixMilanF *self, const guint8 *otp, gsize otp_len)
++{
++  memcpy (self->config, milanf_config, sizeof (self->config));
++
++  if (otp_len >= 0x20 && otp[0x16] && otp[0x16] + otp[0x17] == 0xff)
++    {
++      guint tcode = ((otp[0x16] >> 4) + 1) * 0x10;
++      guint diff = ((((otp[0x16] & 0xf) + 2) * 0x6400 / tcode & 0xffff) / 3) >> 4;
++
++      fp_dbg ("OTP calibration: tcode 0x%x, fdt delta 0x%x", tcode, diff);
++      config_patch_tag (self->config, 9, 0x5c, tcode & 0xff, tcode >> 8);
++      config_patch_tag (self->config, 5, 0x82, -1, diff & 0xff);
++    }
++  else
++    {
++      fp_warn ("OTP calibration missing, using default config");
++    }
++  config_fix_checksum (self->config);
++}
++
++/* ------------------------------------------------------------------ */
++/* Command transaction sub-state-machine                               */
++
++enum {
++  CMD_SEND,
++  CMD_READ_ACK,
++  CMD_READ_FIRST,
++  CMD_READ_REST,
++  CMD_NUM_STATES,
++};
++
++/* The MCU follows full packets with zero-length packets; skip them. */
++static gboolean
++skip_zlp (FpiUsbTransfer *transfer, FpiUsbTransferCallback cb)
++{
++  if (transfer->actual_length > 0)
++    return FALSE;
++  fpi_usb_transfer_submit (fpi_usb_transfer_ref (transfer),
++                           REPLY_TIMEOUT, NULL, cb, NULL);
++  return TRUE;
++}
++
++static void
++cmd_read_ack_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                 gpointer user_data, GError *error)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  const guint8 *b = transfer->buffer;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++  if (skip_zlp (transfer, cmd_read_ack_cb))
++    return;
++  if (b[0] != CMD_ACK || b[3] != self->tx_cmd)
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Expected ACK for 0x%02x, got %02x %02x %02x %02x",
++                                                     self->tx_cmd, b[0], b[1], b[2], b[3]));
++      return;
++    }
++  self->ack_flags = b[4];
++  if (self->tx_want_reply)
++    fpi_ssm_next_state (transfer->ssm);
++  else
++    fpi_ssm_mark_completed (transfer->ssm);
++}
++
++static gboolean
++cmd_finish_reply (FpiDeviceGoodixMilanF *self, FpiSsm *ssm)
++{
++  guint8 csum = self->rx_buf[self->rx_total - 1];
++
++  if (csum != 0x88 && csum != msg_checksum (self->rx_buf, self->rx_total - 1))
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Bad checksum on reply 0x%02x",
++                                                          self->rx_cmd));
++      return FALSE;
++    }
++  if (self->rx_cmd != self->tx_cmd)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Expected reply 0x%02x, got 0x%02x",
++                                                          self->tx_cmd, self->rx_cmd));
++      return FALSE;
++    }
++  fpi_ssm_mark_completed (ssm);
++  return TRUE;
++}
++
++static void
++cmd_read_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                   gpointer user_data, GError *error)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  const guint8 *b = transfer->buffer;
++  gsize size;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++  if (skip_zlp (transfer, cmd_read_first_cb))
++    return;
++  self->rx_cmd = b[0];
++  size = b[1] | b[2] << 8;
++  self->rx_total = size + 3;
++  if (size < 1 || self->rx_total > 32768)
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Bad reply size %zu", size));
++      return;
++    }
++  g_clear_pointer (&self->rx_buf, g_free);
++  self->rx_buf = g_malloc (self->rx_total);
++  self->rx_have = MIN (CHUNK, self->rx_total);
++  memcpy (self->rx_buf, b, self->rx_have);
++
++  if (self->rx_have == self->rx_total)
++    cmd_finish_reply (self, transfer->ssm);
++  else
++    fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++cmd_read_rest_cb (FpiUsbTransfer *transfer, FpDevice *dev,
++                  gpointer user_data, GError *error)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++  for (gsize off = 0; off < (gsize) transfer->actual_length && self->rx_have < self->rx_total;
++       off += CHUNK)
++    {
++      const guint8 *c = transfer->buffer + off;
++      gsize n = MIN (CHUNK - 1, self->rx_total - self->rx_have);
++
++      if (c[0] != (self->rx_cmd | 1))
++        {
++          fpi_ssm_mark_failed (transfer->ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Bad continuation 0x%02x", c[0]));
++          return;
++        }
++      memcpy (self->rx_buf + self->rx_have, c + 1, n);
++      self->rx_have += n;
++    }
++  if (self->rx_have < self->rx_total)
++    {
++      /* short transfer (ZLP after a packet): read the rest */
++      fpi_ssm_jump_to_state (transfer->ssm, CMD_READ_REST);
++      return;
++    }
++  cmd_finish_reply (self, transfer->ssm);
++}
++
++static void
++cmd_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++
++  transfer->ssm = ssm;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CMD_SEND:
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, EP_OUT, g_steal_pointer (&self->tx_buf),
++                                       self->tx_len, g_free);
++      fpi_usb_transfer_submit (transfer, ACK_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case CMD_READ_ACK:
++      fpi_usb_transfer_fill_bulk (transfer, EP_IN, CHUNK);
++      fpi_usb_transfer_submit (transfer, ACK_TIMEOUT, NULL, cmd_read_ack_cb, NULL);
++      break;
++
++    case CMD_READ_FIRST:
++      fpi_usb_transfer_fill_bulk (transfer, EP_IN, CHUNK);
++      fpi_usb_transfer_submit (transfer, REPLY_TIMEOUT, NULL, cmd_read_first_cb, NULL);
++      break;
++
++    case CMD_READ_REST:
++      {
++        gsize left = self->rx_total - self->rx_have;
++        gsize chunks = (left + CHUNK - 2) / (CHUNK - 1);
++
++        fpi_usb_transfer_fill_bulk (transfer, EP_IN, chunks * CHUNK);
++        fpi_usb_transfer_submit (transfer, REPLY_TIMEOUT, NULL, cmd_read_rest_cb, NULL);
++      }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++/* Start a command as a sub-ssm of @parent. Parent advances on success. */
++static void
++milanf_cmd (FpiSsm *parent, FpiDeviceGoodixMilanF *self, guint8 cmd,
++            const guint8 *payload, gsize len, gboolean want_reply)
++{
++  gsize msg_len = len + 4;
++  g_autofree guint8 *msg = g_malloc (msg_len);
++  gsize nchunks, o = 0;
++  FpiSsm *ssm;
++
++  msg[0] = cmd;
++  msg[1] = (len + 1) & 0xff;
++  msg[2] = (len + 1) >> 8;
++  if (len)
++    memcpy (msg + 3, payload, len);
++  msg[msg_len - 1] = msg_checksum (msg, msg_len - 1);
++
++  /* Chunk into 64-byte packets: first raw, then (cmd|1) + 63 bytes */
++  nchunks = msg_len <= CHUNK ? 1 : 1 + (msg_len - CHUNK + CHUNK - 2) / (CHUNK - 1);
++  g_clear_pointer (&self->tx_buf, g_free);
++  self->tx_buf = g_malloc0 (nchunks * CHUNK);
++  self->tx_len = nchunks * CHUNK;
++  memcpy (self->tx_buf, msg, MIN (CHUNK, msg_len));
++  o = MIN (CHUNK, msg_len);
++  for (gsize c = 1; c < nchunks; c++)
++    {
++      gsize n = MIN (CHUNK - 1, msg_len - o);
++
++      self->tx_buf[c * CHUNK] = cmd | 1;
++      memcpy (self->tx_buf + c * CHUNK + 1, msg + o, n);
++      o += n;
++    }
++
++  self->tx_cmd = cmd;
++  self->tx_want_reply = want_reply;
++  ssm = fpi_ssm_new (FP_DEVICE (self), cmd_run_state, CMD_NUM_STATES);
++  fpi_ssm_start_subsm (parent, ssm);
++}
++
++/* ------------------------------------------------------------------ */
++/* Open / init                                                         */
++
++enum {
++  INIT_DRAIN,
++  INIT_PING,
++  INIT_FW_VERSION,
++  INIT_RESET,
++  INIT_CHIP_ID,
++  INIT_OTP,
++  INIT_CONFIG,
++  INIT_CHECK_CONFIG,
++  INIT_NUM_STATES,
++};
++
++static void
++drain_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  if (error)
++    {
++      /* timeout = nothing pending, which is what we want */
++      g_error_free (error);
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++  fp_dbg ("drained stale packet 0x%02x", transfer->buffer[0]);
++  fpi_ssm_jump_to_state (transfer->ssm, INIT_DRAIN);
++}
++
++static void
++init_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  const guint8 *p;
++  gsize plen;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case INIT_DRAIN:
++      {
++        FpiUsbTransfer *transfer = fpi_usb_transfer_new (dev);
++
++        transfer->ssm = ssm;
++        fpi_usb_transfer_fill_bulk (transfer, EP_IN, CHUNK);
++        fpi_usb_transfer_submit (transfer, 60, NULL, drain_cb, NULL);
++      }
++      break;
++
++    case INIT_PING:
++      {
++        static const guint8 z[2] = { 0, 0 };
++
++        milanf_cmd (ssm, self, CMD_NOP, z, 2, FALSE);
++      }
++      break;
++
++    case INIT_FW_VERSION:
++      {
++        static const guint8 z[2] = { 0, 0 };
++
++        milanf_cmd (ssm, self, CMD_FW_VERSION, z, 2, TRUE);
++      }
++      break;
++
++    case INIT_RESET:
++      {
++        /* sensor reset (type 0, 20 ms); HT_APP always replies */
++        static const guint8 r[2] = { 0x01, 0x14 };
++        g_autofree gchar *fw = NULL;
++
++        p = reply_payload (self, &plen);
++        fw = g_strndup ((const gchar *) p, plen);
++        fp_info ("Firmware: %s", fw);
++        if (!strstr (fw, "_HT_APP_"))
++          fp_warn ("Unexpected firmware %s, continuing anyway", fw);
++        milanf_cmd (ssm, self, CMD_RESET, r, 2, TRUE);
++      }
++      break;
++
++    case INIT_CHIP_ID:
++      {
++        static const guint8 r[5] = { 0x00, 0x00, 0x00, 0x04, 0x00 };
++
++        milanf_cmd (ssm, self, CMD_READ_REG, r, 5, TRUE);
++      }
++      break;
++
++    case INIT_OTP:
++      {
++        static const guint8 z[2] = { 0, 0 };
++        guint id;
++
++        p = reply_payload (self, &plen);
++        if (plen < 4)
++          {
++            fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++            return;
++          }
++        /* registers are big-endian 16-bit words */
++        id = p[0] | p[3] << 8 | p[2] << 16;
++        fp_info ("Chip ID: 0x%x", id);
++        if (id != CHIP_ID_MILANF)
++          {
++            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                                                "Unsupported chip 0x%x", id));
++            return;
++          }
++        milanf_cmd (ssm, self, CMD_READ_OTP, z, 2, TRUE);
++      }
++      break;
++
++    case INIT_CONFIG:
++      p = reply_payload (self, &plen);
++      build_config (self, p, plen);
++      milanf_cmd (ssm, self, CMD_UPLOAD_CFG, self->config, sizeof (self->config), TRUE);
++      break;
++
++    case INIT_CHECK_CONFIG:
++      p = reply_payload (self, &plen);
++      if (plen < 1 || p[0] != 1)
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                              "Config upload rejected"));
++          return;
++        }
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++init_done (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  fpi_device_open_complete (dev, error);
++}
++
++static void
++dev_open (FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  GUsbDevice *usb = fpi_device_get_usb_device (dev);
++  GError *error = NULL;
++
++  self->base_frames = 0;
++  /* cdc_acm binds both interfaces; take them back from it */
++  if (!g_usb_device_claim_interface (usb, CTRL_IFACE,
++                                     G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER, &error) ||
++      !g_usb_device_claim_interface (usb, DATA_IFACE,
++                                     G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER, &error))
++    {
++      fpi_device_open_complete (dev, error);
++      return;
++    }
++  fpi_ssm_start (fpi_ssm_new (dev, init_run_state, INIT_NUM_STATES), init_done);
++}
++
++static void
++dev_close (FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  GUsbDevice *usb = fpi_device_get_usb_device (dev);
++  GError *error = NULL;
++
++  g_clear_pointer (&self->rx_buf, g_free);
++  g_clear_pointer (&self->tx_buf, g_free);
++  g_usb_device_release_interface (usb, DATA_IFACE,
++                                  G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER, NULL);
++  g_usb_device_release_interface (usb, CTRL_IFACE,
++                                  G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER, &error);
++  fpi_device_close_complete (dev, error);
++}
++
++/* ------------------------------------------------------------------ */
++/* Image processing                                                    */
++
++static gboolean
++decode_frame (FpiDeviceGoodixMilanF *self)
++{
++  gsize plen;
++  const guint8 *p = reply_payload (self, &plen);
++  g_autofree guint8 *body = NULL;
++  gsize blen;
++  guint32 want, got;
++
++  /* Windows driver: data starts 5 bytes in, length = size - 6 */
++  if (plen < RAW_PIX_BYTES + 9)            /* 5 header + pixels + 4 CRC */
++    return FALSE;
++  blen = plen + 1 - 6;
++  body = g_memdup2 (p + 5, blen);
++  want = (guint32) body[blen - 2] << 24 | (guint32) body[blen - 1] << 16 |
++         (guint32) body[blen - 4] << 8 | body[blen - 3];
++  got = crc32_mpeg2 (body, blen - 4);
++  if (want != got)
++    {
++      fp_dbg ("frame CRC mismatch %08x != %08x", want, got);
++      return FALSE;
++    }
++  prbs_decrypt (body, blen - 4);
++  decode_12bit (body, self->frame);
++  return TRUE;
++}
++
++static gdouble
++frame_diff_var (FpiDeviceGoodixMilanF *self, gdouble *diff, gdouble *mean)
++{
++  gdouble sum = 0, sq = 0, m;
++
++  for (int i = 0; i < NPIX; i++)
++    {
++      gdouble d = self->base[i] - self->frame[i];
++
++      if (diff)
++        diff[i] = d;
++      sum += d;
++      sq += d * d;
++    }
++  m = sum / NPIX;
++  if (mean)
++    *mean = m;
++  return sq / NPIX - m * m;
++}
++
++static int
++cmp_double (const void *a, const void *b)
++{
++  gdouble x = *(const gdouble *) a, y = *(const gdouble *) b;
++
++  return (x > y) - (x < y);
++}
++
++/* box mean over (2r+1)^2 with edge clamping, via an integral image */
++static void
++box_mean (const gdouble *in, gdouble *out, int r)
++{
++  g_autofree gdouble *integ = g_new0 (gdouble, (IMG_W + 1) * (IMG_H + 1));
++
++  for (int y = 0; y < IMG_H; y++)
++    for (int x = 0; x < IMG_W; x++)
++      integ[(y + 1) * (IMG_W + 1) + x + 1] = in[y * IMG_W + x] +
++                                             integ[y * (IMG_W + 1) + x + 1] +
++                                             integ[(y + 1) * (IMG_W + 1) + x] -
++                                             integ[y * (IMG_W + 1) + x];
++  for (int y = 0; y < IMG_H; y++)
++    for (int x = 0; x < IMG_W; x++)
++      {
++        int x0 = MAX (0, x - r), x1 = MIN (IMG_W, x + r + 1);
++        int y0 = MAX (0, y - r), y1 = MIN (IMG_H, y + r + 1);
++        gdouble s = integ[y1 * (IMG_W + 1) + x1] - integ[y0 * (IMG_W + 1) + x1] -
++                    integ[y1 * (IMG_W + 1) + x0] + integ[y0 * (IMG_W + 1) + x0];
++
++        out[y * IMG_W + x] = s / ((x1 - x0) * (y1 - y0));
++      }
++}
++
++/* baseline-subtracted frame -> locally normalised, stretched 8-bit image */
++static guint8 *
++make_image (const gdouble *diff)
++{
++  g_autofree gdouble *m = g_new (gdouble, NPIX);
++  g_autofree gdouble *sq = g_new (gdouble, NPIX);
++  g_autofree gdouble *m2 = g_new (gdouble, NPIX);
++  g_autofree gdouble *x = g_new (gdouble, NPIX);
++  g_autofree gdouble *sorted = NULL;
++  guint8 *img = g_malloc (NPIX);
++  gdouble lo, hi;
++
++  for (int i = 0; i < NPIX; i++)
++    sq[i] = diff[i] * diff[i];
++  box_mean (diff, m, 8);
++  box_mean (sq, m2, 8);
++  for (int i = 0; i < NPIX; i++)
++    x[i] = (diff[i] - m[i]) / sqrt (MAX (m2[i] - m[i] * m[i], 1.0));
++
++  sorted = g_memdup2 (x, NPIX * sizeof (gdouble));
++  qsort (sorted, NPIX, sizeof (gdouble), cmp_double);
++  lo = sorted[NPIX / 100];
++  hi = sorted[NPIX - 1 - NPIX / 100];
++  if (hi - lo < 1e-6)
++    hi = lo + 1e-6;
++  for (int i = 0; i < NPIX; i++)
++    img[i] = (guint8) CLAMP ((x[i] - lo) * 255.0 / (hi - lo), 0, 255);
++  return img;
++}
++
++/* Debug: GOODIXMILANF_DUMP=<dir> saves each touch (baseline - frame,
++ * offset by 32768) as a 16-bit PGM for offline matcher work. */
++static void
++dump_diff (FpiDeviceGoodixMilanF *self)
++{
++  const gchar *dir = g_getenv ("GOODIXMILANF_DUMP");
++  g_autofree gchar *path = NULL;
++  g_autofree gchar *hdr = NULL;
++  g_autofree guint8 *out = NULL;
++  gsize hl;
++
++  if (!dir || !*dir)
++    return;
++  path = g_strdup_printf ("%s/diff-%04u.pgm", dir, self->dump_seq++);
++  hdr = g_strdup_printf ("P5\n%d %d\n65535\n", IMG_W, IMG_H);
++  hl = strlen (hdr);
++  out = g_malloc (hl + NPIX * 2);
++  memcpy (out, hdr, hl);
++  for (int i = 0; i < NPIX; i++)
++    {
++      guint16 v = (guint16) CLAMP (self->best_diff[i] + 32768.0, 0, 65535);
++
++      out[hl + 2 * i] = v >> 8;
++      out[hl + 2 * i + 1] = v & 0xff;
++    }
++  if (g_file_set_contents (path, (const gchar *) out, hl + NPIX * 2, NULL))
++    fp_dbg ("dumped %s", path);
++}
++
++/* ------------------------------------------------------------------ */
++/* Print data: GVariant (q aay) = version, serialized SIGFM per sample  */
++
++static GVariant *
++infos_to_variant (GPtrArray *infos)
++{
++  GVariantBuilder b;
++
++  g_variant_builder_init (&b, G_VARIANT_TYPE ("aay"));
++  for (guint i = 0; i < infos->len; i++)
++    {
++      gsize len;
++      guint8 *data = gx_sigfm_serialize (g_ptr_array_index (infos, i), &len);
++
++      g_variant_builder_add_value (&b, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                                  data, len, 1));
++      free (data);
++    }
++  return g_variant_new ("(q@aay)", PRINT_VERSION, g_variant_builder_end (&b));
++}
++
++static GPtrArray *
++print_to_infos (FpPrint *print)
++{
++  g_autoptr(GVariant) data = NULL;
++  g_autoptr(GVariant) samples = NULL;
++  GPtrArray *infos = g_ptr_array_new_with_free_func ((GDestroyNotify) gx_sigfm_free);
++  guint16 version = 0;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(qaay)")))
++    return infos;
++  g_variant_get (data, "(q@aay)", &version, &samples);
++  if (version != PRINT_VERSION)
++    return infos;
++  for (gsize i = 0; i < g_variant_n_children (samples); i++)
++    {
++      g_autoptr(GVariant) s = g_variant_get_child_value (samples, i);
++      gsize len;
++      const guint8 *bytes = g_variant_get_fixed_array (s, &len, 1);
++      GxSigfm *info = gx_sigfm_deserialize (bytes, len);
++
++      if (info)
++        g_ptr_array_add (infos, info);
++    }
++  return infos;
++}
++
++static gint
++best_score (const GxSigfm *probe, FpPrint *print)
++{
++  g_autoptr(GPtrArray) infos = print_to_infos (print);
++  gint best = 0;
++
++  for (guint i = 0; i < infos->len && best < MATCH_THRESHOLD; i++)
++    best = MAX (best, gx_sigfm_score (probe, g_ptr_array_index (infos, i), MATCH_THRESHOLD));
++  return best;
++}
++
++/* ------------------------------------------------------------------ */
++/* Touch handling per action. Returns TRUE when the action is finished. */
++
++static gboolean
++handle_touch (FpiDeviceGoodixMilanF *self, const guint8 *img)
++{
++  FpDevice *dev = FP_DEVICE (self);
++  GxSigfm *info = gx_sigfm_extract (img, IMG_W, IMG_H);
++  gint kp = gx_sigfm_keypoints (info);
++
++  fp_dbg ("touch: %d keypoints", kp);
++
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++      {
++        FpPrint *print = NULL;
++
++        fpi_device_get_enroll_data (dev, &print);
++        if (!info || kp < MIN_KEYPOINTS)
++          {
++            gx_sigfm_free (info);
++            fpi_device_enroll_progress (dev, self->enroll_infos->len, NULL,
++                                        fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
++            return FALSE;
++          }
++        g_ptr_array_add (self->enroll_infos, info);
++        if (self->enroll_infos->len >= ENROLL_STAGES)
++          {
++            fpi_print_set_type (print, FPI_PRINT_RAW);
++            fpi_print_set_device_stored (print, FALSE);
++            g_object_set (print, "fpi-data", infos_to_variant (self->enroll_infos), NULL);
++          }
++        fpi_device_enroll_progress (dev, self->enroll_infos->len, print, NULL);
++        return self->enroll_infos->len >= ENROLL_STAGES;
++      }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++      {
++        FpPrint *print = NULL;
++        gint score;
++
++        if (!info || kp < MIN_KEYPOINTS)
++          {
++            gx_sigfm_free (info);
++            fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
++                                      fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
++            return TRUE;
++          }
++        fpi_device_get_verify_data (dev, &print);
++        score = best_score (info, print);
++        gx_sigfm_free (info);
++        fp_info ("verify score %d (threshold %d)", score, MATCH_THRESHOLD);
++        fpi_device_verify_report (dev, score >= MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
++                                  NULL, NULL);
++        return TRUE;
++      }
++  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
++      {
++        GPtrArray *prints = NULL;
++        FpPrint *match = NULL;
++
++        if (!info || kp < MIN_KEYPOINTS)
++          {
++            gx_sigfm_free (info);
++            fpi_device_identify_report (dev, NULL, NULL,
++                                        fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
++            return TRUE;
++          }
++        fpi_device_get_identify_data (dev, &prints);
++        for (guint i = 0; i < prints->len && !match; i++)
++          {
++            gint score = best_score (info, g_ptr_array_index (prints, i));
++
++            fp_info ("identify: print %u score %d", i, score);
++            if (score >= MATCH_THRESHOLD)
++              match = g_ptr_array_index (prints, i);
++          }
++        gx_sigfm_free (info);
++        fpi_device_identify_report (dev, match, NULL, NULL);
++        return TRUE;
++      }
++
++  gx_sigfm_free (info);
++  return TRUE;
++}
++
++/* ------------------------------------------------------------------ */
++/* Capture loop (one per action)                                       */
++
++enum {
++  TOUCH_WAIT_CLEAR,
++  TOUCH_WAIT_FINGER,
++  TOUCH_SCANNING,
++  TOUCH_WAIT_LIFT,
++};
++
++enum {
++  LOOP_CAPTURE,
++  LOOP_PROCESS,
++  LOOP_RECONFIG,
++  LOOP_RECONFIG_DONE,
++  LOOP_NUM_STATES,
++};
++
++static void
++set_phase (FpiDeviceGoodixMilanF *self, int phase)
++{
++  FpDevice *dev = FP_DEVICE (self);
++
++  self->phase = phase;
++  switch (phase)
++    {
++    case TOUCH_WAIT_FINGER:
++      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_PRESENT);
++      break;
++
++    case TOUCH_SCANNING:
++      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
++                                               FP_FINGER_STATUS_NEEDED);
++      break;
++
++    case TOUCH_WAIT_LIFT:
++    case TOUCH_WAIT_CLEAR:
++    default:
++      break;
++    }
++}
++
++static void
++loop_process (FpiSsm *ssm, FpiDeviceGoodixMilanF *self)
++{
++  g_autofree gdouble *diff = g_new (gdouble, NPIX);
++  gdouble var, shift = 0;
++
++  if (self->ack_flags & 0x02)
++    {
++      fp_dbg ("sensor lost its config, re-uploading");
++      fpi_ssm_jump_to_state (ssm, LOOP_RECONFIG);
++      return;
++    }
++  if (!decode_frame (self))
++    {
++      fp_dbg ("dropping undecodable frame");
++      fpi_ssm_jump_to_state_delayed (ssm, LOOP_CAPTURE, POLL_DELAY);
++      return;
++    }
++
++  if (self->base_frames < BASE_FRAMES)
++    {
++      for (int i = 0; i < NPIX; i++)
++        self->base[i] = (self->base[i] * self->base_frames + self->frame[i]) /
++                        (self->base_frames + 1);
++      self->base_frames++;
++      self->busy_since = g_get_monotonic_time ();
++      fpi_ssm_jump_to_state (ssm, LOOP_CAPTURE);
++      return;
++    }
++
++  var = frame_diff_var (self, diff, &shift);
++  if ((++self->dbg_frames % 50) == 0)
++    fp_dbg ("frame %u: var %.0f, shift %.0f, phase %d", self->dbg_frames, var, shift, self->phase);
++
++  /* Baseline sanity: brighter than "empty" is impossible unless the baseline
++   * was taken with a finger on (e.g. right after the previous action). */
++  if ((self->phase == TOUCH_WAIT_CLEAR || self->phase == TOUCH_WAIT_FINGER) &&
++      shift < REBASE_SHIFT)
++    {
++      if (self->bright_frames == 0)
++        memset (self->rebase, 0, NPIX * sizeof (gdouble));
++      for (int i = 0; i < NPIX; i++)
++        self->rebase[i] += self->frame[i];
++      if (++self->bright_frames >= REBASE_FRAMES)
++        {
++          fp_info ("baseline contained a finger (shift %.0f), retaking it", shift);
++          for (int i = 0; i < NPIX; i++)
++            self->base[i] = self->rebase[i] / self->bright_frames;
++          self->bright_frames = 0;
++        }
++      fpi_ssm_jump_to_state_delayed (ssm, LOOP_CAPTURE, POLL_DELAY);
++      return;
++    }
++  self->bright_frames = 0;
++
++  if (var < IDLE_VAR)
++    for (int i = 0; i < NPIX; i++)
++      self->base[i] = self->base[i] * 0.9 + self->frame[i] * 0.1;
++
++  if (var < FINGER_OFF_VAR)
++    self->busy_since = g_get_monotonic_time ();
++  else if (self->phase == TOUCH_WAIT_CLEAR &&
++           g_get_monotonic_time () - self->busy_since > 15 * G_USEC_PER_SEC)
++    {
++      /* never seen the sensor empty: the baseline is probably bad */
++      fp_warn ("sensor never clears, retaking baseline");
++      self->base_frames = 0;
++    }
++
++  switch (self->phase)
++    {
++    case TOUCH_WAIT_CLEAR:
++      if (var < FINGER_OFF_VAR)
++        set_phase (self, TOUCH_WAIT_FINGER);
++      break;
++
++    case TOUCH_WAIT_FINGER:
++      if (var > FINGER_ON_VAR && shift > FINGER_MIN_SHIFT)
++        {
++          fp_dbg ("finger on (var %.0f, shift %.0f)", var, shift);
++          self->scan_frames = 0;
++          self->best_var = 0;
++          set_phase (self, TOUCH_SCANNING);
++        }
++      break;
++
++    case TOUCH_SCANNING:
++      if (var > FINGER_ON_VAR)
++        {
++          self->scan_frames++;
++          if (var > self->best_var)
++            {
++              self->best_var = var;
++              memcpy (self->best_diff, diff, NPIX * sizeof (gdouble));
++            }
++        }
++      if (self->scan_frames >= FRAMES_PER_SCAN ||
++          (var <= FINGER_ON_VAR && self->scan_frames > 0))
++        {
++          g_autofree guint8 *img = make_image (self->best_diff);
++
++          dump_diff (self);
++          set_phase (self, TOUCH_WAIT_LIFT);
++          if (handle_touch (self, img))
++            {
++              fpi_ssm_mark_completed (ssm);
++              return;
++            }
++        }
++      else if (var <= FINGER_OFF_VAR && self->scan_frames == 0)
++        {
++          set_phase (self, TOUCH_WAIT_FINGER);
++        }
++      break;
++
++    case TOUCH_WAIT_LIFT:
++      if (var < FINGER_OFF_VAR)
++        {
++          fp_dbg ("finger off (var %.0f)", var);
++          fpi_device_report_finger_status_changes (FP_DEVICE (self), FP_FINGER_STATUS_NONE,
++                                                   FP_FINGER_STATUS_PRESENT);
++          set_phase (self, TOUCH_WAIT_FINGER);
++        }
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++
++  fpi_ssm_jump_to_state_delayed (ssm, LOOP_CAPTURE, POLL_DELAY);
++}
++
++static void
++loop_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  GCancellable *c = fpi_device_get_cancellable (dev);
++
++  if (c && g_cancellable_is_cancelled (c))
++    {
++      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                                     "Operation was cancelled"));
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case LOOP_RECONFIG:
++      self->ack_flags = 0;
++      milanf_cmd (ssm, self, CMD_UPLOAD_CFG, self->config, sizeof (self->config), TRUE);
++      break;
++
++    case LOOP_CAPTURE:
++      {
++        static const guint8 req[2] = { 0x01, 0x00 };
++
++        milanf_cmd (ssm, self, CMD_GET_IMAGE, req, 2, TRUE);
++      }
++      break;
++
++    case LOOP_PROCESS:
++      loop_process (ssm, self);
++      break;
++
++    case LOOP_RECONFIG_DONE:
++      fpi_ssm_jump_to_state (ssm, LOOP_CAPTURE);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++loop_done (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++
++  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
++                                           FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
++
++  FpiDeviceAction action = fpi_device_get_current_action (dev);
++
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    {
++      FpPrint *print = NULL;
++
++      fpi_device_get_enroll_data (dev, &print);
++      g_clear_pointer (&self->enroll_infos, g_ptr_array_unref);
++      if (error)
++        fpi_device_enroll_complete (dev, NULL, error);
++      else
++        fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
++    }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      fpi_device_verify_complete (dev, error);
++    }
++  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      fpi_device_identify_complete (dev, error);
++    }
++  else if (error)
++    {
++      fpi_device_action_error (dev, error);
++    }
++}
++
++static void
++start_loop (FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++  FpiSsm *ssm = fpi_ssm_new (dev, loop_run_state, LOOP_NUM_STATES);
++
++  self->phase = TOUCH_WAIT_CLEAR;
++  self->busy_since = g_get_monotonic_time ();
++  fpi_ssm_start (ssm, loop_done);
++}
++
++static void
++dev_enroll (FpDevice *dev)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (dev);
++
++  g_clear_pointer (&self->enroll_infos, g_ptr_array_unref);
++  self->enroll_infos = g_ptr_array_new_with_free_func ((GDestroyNotify) gx_sigfm_free);
++  start_loop (dev);
++}
++
++static void
++dev_verify_identify (FpDevice *dev)
++{
++  start_loop (dev);
++}
++
++/* ------------------------------------------------------------------ */
++
++static const FpIdEntry id_table[] = {
++  { .vid = 0x27c6, .pid = 0x5301, },
++  { .vid = 0, .pid = 0, .driver_data = 0 },
++};
++
++static void
++fpi_device_goodixmilanf_init (FpiDeviceGoodixMilanF *self)
++{
++  self->frame = g_new0 (guint16, NPIX);
++  self->base = g_new0 (gdouble, NPIX);
++  self->best_diff = g_new0 (gdouble, NPIX);
++  self->rebase = g_new0 (gdouble, NPIX);
++}
++
++static void
++fpi_device_goodixmilanf_finalize (GObject *object)
++{
++  FpiDeviceGoodixMilanF *self = FPI_DEVICE_GOODIXMILANF (object);
++
++  g_clear_pointer (&self->rx_buf, g_free);
++  g_clear_pointer (&self->tx_buf, g_free);
++  g_clear_pointer (&self->frame, g_free);
++  g_clear_pointer (&self->base, g_free);
++  g_clear_pointer (&self->best_diff, g_free);
++  g_clear_pointer (&self->rebase, g_free);
++  g_clear_pointer (&self->enroll_infos, g_ptr_array_unref);
++  G_OBJECT_CLASS (fpi_device_goodixmilanf_parent_class)->finalize (object);
++}
++
++static void
++fpi_device_goodixmilanf_class_init (FpiDeviceGoodixMilanFClass *klass)
++{
++  GObjectClass *obj_class = G_OBJECT_CLASS (klass);
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++
++  obj_class->finalize = fpi_device_goodixmilanf_finalize;
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "Goodix Milan F (GF5288 HT_APP) Fingerprint Sensor";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  /* small (5 x 4 mm) sensor: many samples give better coverage */
++  dev_class->nr_enroll_stages = ENROLL_STAGES;
++  /* capacitive sensor polled at ~10 Hz: no thermal limit needed */
++  dev_class->temp_hot_seconds = -1;
++
++  dev_class->open = dev_open;
++  dev_class->close = dev_close;
++  dev_class->enroll = dev_enroll;
++  dev_class->verify = dev_verify_identify;
++  dev_class->identify = dev_verify_identify;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++}
+diff --git a/libfprint/drivers/goodixmilanf/sigfm.cpp b/libfprint/drivers/goodixmilanf/sigfm.cpp
+new file mode 100644
+index 00000000..1664dd3a
+--- /dev/null
++++ b/libfprint/drivers/goodixmilanf/sigfm.cpp
+@@ -0,0 +1,202 @@
++/*
++ * SIGFM ("SIFT Is Good For Matching") for small-area sensors.
++ * Based on the algorithm by Matthieu Charette, Natasha England-Elbro and
++ * Timur Mangliev (goodix-fp-linux-dev/libfprint, branch sigfm), LGPL-2.1+.
++ *
++ * Differences from that implementation: matches are de-duplicated on the
++ * full point pair (the original std::set comparator only looked at y),
++ * descriptors are stored as bytes (OpenCV SIFT values are integers in
++ * 0..255), and scoring can stop early at a caller-supplied cap.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "sigfm.h"
++
++#include <opencv2/core.hpp>
++#include <opencv2/features2d.hpp>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <set>
++#include <utility>
++#include <vector>
++
++struct GxSigfm
++{
++  std::vector<cv::Point2f> pts;
++  cv::Mat                  desc; /* CV_32F, rows = pts.size(), 128 cols */
++};
++
++namespace {
++constexpr double kDistanceRatio = 0.75;
++constexpr double kLengthTol = 0.05;
++constexpr double kAngleTol = 0.05;
++constexpr size_t kMinMatch = 5;
++
++struct Angle
++{
++  double c, s;
++};
++} // namespace
++
++extern "C" GxSigfm *
++gx_sigfm_extract (const unsigned char *pix, int width, int height)
++{
++  try
++    {
++      cv::Mat img (height, width, CV_8UC1, const_cast<unsigned char *> (pix));
++      std::vector<cv::KeyPoint> kps;
++      auto *info = new GxSigfm;
++
++      cv::SIFT::create ()->detectAndCompute (img, cv::noArray (), kps, info->desc);
++      for (const auto &k : kps)
++        info->pts.push_back (k.pt);
++      if (info->desc.type () != CV_32F && !info->desc.empty ())
++        info->desc.convertTo (info->desc, CV_32F);
++      return info;
++    }
++  catch (...)
++    {
++      return nullptr;
++    }
++}
++
++extern "C" void
++gx_sigfm_free (GxSigfm *info)
++{
++  delete info;
++}
++
++extern "C" int
++gx_sigfm_keypoints (const GxSigfm *info)
++{
++  return info ? (int) info->pts.size () : 0;
++}
++
++extern "C" int
++gx_sigfm_score (const GxSigfm *probe, const GxSigfm *enrolled, int cap)
++{
++  try
++    {
++      if (!probe || !enrolled || probe->desc.rows < 2 || enrolled->desc.rows < 2)
++        return 0;
++
++      std::vector<std::vector<cv::DMatch>> knn;
++      cv::BFMatcher (cv::NORM_L2).knnMatch (probe->desc, enrolled->desc, knn, 2);
++
++      std::set<std::pair<std::pair<int, int>, std::pair<int, int>>> uniq;
++      size_t matched = 0;
++      for (const auto &m : knn)
++        {
++          if (m.size () < 2 || !(m[0].distance < kDistanceRatio * m[1].distance))
++            continue;
++          const cv::Point2f &a = probe->pts.at (m[0].queryIdx);
++          const cv::Point2f &b = enrolled->pts.at (m[0].trainIdx);
++          uniq.insert ({ { (int) a.x, (int) a.y }, { (int) b.x, (int) b.y } });
++          matched++;
++        }
++      if (matched < kMinMatch)
++        return 0;
++
++      std::vector<std::pair<std::pair<int, int>, std::pair<int, int>>> ms (uniq.begin (), uniq.end ());
++      std::vector<Angle> angles;
++      for (size_t j = 0; j < ms.size (); j++)
++        for (size_t k = j + 1; k < ms.size (); k++)
++          {
++            double v1x = ms[j].first.first - ms[k].first.first;
++            double v1y = ms[j].first.second - ms[k].first.second;
++            double v2x = ms[j].second.first - ms[k].second.first;
++            double v2y = ms[j].second.second - ms[k].second.second;
++            double l1 = std::hypot (v1x, v1y), l2 = std::hypot (v2x, v2y);
++
++            if (l1 == 0 || l2 == 0)
++              continue;
++            if (1 - std::min (l1, l2) / std::max (l1, l2) <= kLengthTol)
++              {
++                double pr = l1 * l2;
++                double dot = std::max (-1.0, std::min (1.0, (v1x * v2x + v1y * v2y) / pr));
++                double crs = std::max (-1.0, std::min (1.0, (v1x * v2y - v1y * v2x) / pr));
++                angles.push_back ({ M_PI / 2 + std::asin (dot), std::acos (crs) });
++              }
++          }
++      if (angles.size () < kMinMatch)
++        return 0;
++
++      int count = 0;
++      for (size_t j = 0; j < angles.size (); j++)
++        for (size_t k = j + 1; k < angles.size (); k++)
++          {
++            const Angle &x = angles[j], &y = angles[k];
++            double ms_ = std::max (x.s, y.s), mc = std::max (x.c, y.c);
++
++            if (ms_ > 0 && mc > 0 &&
++                1 - std::min (x.s, y.s) / ms_ <= kAngleTol &&
++                1 - std::min (x.c, y.c) / mc <= kAngleTol)
++              {
++                count++;
++                if (cap > 0 && count >= cap)
++                  return count;
++              }
++          }
++      return count;
++    }
++  catch (...)
++    {
++      return -1;
++    }
++}
++
++extern "C" unsigned char *
++gx_sigfm_serialize (const GxSigfm *info, size_t *len)
++{
++  size_t n = std::min<size_t> (info->pts.size (), 0xffff);
++  size_t sz = 2 + n * (8 + 128);
++  auto *out = static_cast<unsigned char *> (std::malloc (sz));
++  unsigned char *p = out;
++
++  p[0] = n & 0xff;
++  p[1] = n >> 8;
++  p += 2;
++  for (size_t i = 0; i < n; i++)
++    {
++      float xy[2] = { info->pts[i].x, info->pts[i].y };
++      std::memcpy (p, xy, 8);
++      p += 8;
++      const float *d = info->desc.ptr<float> ((int) i);
++      for (int c = 0; c < 128; c++)
++        *p++ = (unsigned char) std::lround (std::min (255.0f, std::max (0.0f, d[c])));
++    }
++  *len = sz;
++  return out;
++}
++
++extern "C" GxSigfm *
++gx_sigfm_deserialize (const unsigned char *data, size_t len)
++{
++  if (len < 2)
++    return nullptr;
++  size_t n = data[0] | data[1] << 8;
++  if (len != 2 + n * (8 + 128))
++    return nullptr;
++
++  auto *info = new GxSigfm;
++  info->desc.create ((int) n, 128, CV_32F);
++  const unsigned char *p = data + 2;
++  for (size_t i = 0; i < n; i++)
++    {
++      float xy[2];
++      std::memcpy (xy, p, 8);
++      p += 8;
++      info->pts.emplace_back (xy[0], xy[1]);
++      float *d = info->desc.ptr<float> ((int) i);
++      for (int c = 0; c < 128; c++)
++        d[c] = *p++;
++    }
++  return info;
++}
+diff --git a/libfprint/drivers/goodixmilanf/sigfm.h b/libfprint/drivers/goodixmilanf/sigfm.h
+new file mode 100644
+index 00000000..acba0c6e
+--- /dev/null
++++ b/libfprint/drivers/goodixmilanf/sigfm.h
+@@ -0,0 +1,37 @@
++/*
++ * SIGFM ("SIFT Is Good For Matching") for small-area sensors.
++ * Based on the algorithm by Matthieu Charette, Natasha England-Elbro and
++ * Timur Mangliev (goodix-fp-linux-dev/libfprint, branch sigfm), LGPL-2.1+.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct GxSigfm GxSigfm;
++
++/* Extract SIFT keypoints/descriptors from an 8-bit grey image. */
++GxSigfm *gx_sigfm_extract (const unsigned char *pix, int width, int height);
++void     gx_sigfm_free (GxSigfm *info);
++int      gx_sigfm_keypoints (const GxSigfm *info);
++
++/* Geometric-consistency score of @probe against @enrolled; 0 = no match,
++ * < 0 = error. Counting stops once @cap is reached (cap <= 0: no cap). */
++int      gx_sigfm_score (const GxSigfm *probe, const GxSigfm *enrolled, int cap);
++
++/* Compact storage: u16 count, then per keypoint f32 x, f32 y, u8 desc[128]. */
++unsigned char *gx_sigfm_serialize (const GxSigfm *info, size_t *len);
++GxSigfm       *gx_sigfm_deserialize (const unsigned char *data, size_t len);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb.c
+index 539f3e69..a252378c 100644
+--- a/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/fprint-list-udev-hwdb.c
+@@ -163,7 +163,6 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x27c6, .pid = 0x5125 },
+   { .vid = 0x27c6, .pid = 0x5201 },
+   { .vid = 0x27c6, .pid = 0x521d },
+-  { .vid = 0x27c6, .pid = 0x5301 },
+   { .vid = 0x27c6, .pid = 0x530c },
+   { .vid = 0x27c6, .pid = 0x532d },
+   { .vid = 0x27c6, .pid = 0x5335 },
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533ca..d184d98d 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -123,6 +123,10 @@ driver_sources = {
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
++    'goodixmilanf' : files(
++        'drivers/goodixmilanf/goodixmilanf.c',
++        'drivers/goodixmilanf/sigfm.cpp',
++    ),
+     'virtual_image' : files('drivers/virtual-image.c'),
+     'virtual_device' : files('drivers/virtual-device.c'),
+     'virtual_device_storage' : files('drivers/virtual-device-storage.c'),
+@@ -147,6 +151,7 @@ helper_sources = {
+     'aes3k': files('drivers/aes3k.c'),
+     'openssl': files(),
+     'pixman': files(),
++    'opencv': files(),
+     'udev': files(),
+     'virtual': files('drivers/virtual-device-listener.c'),
+ }
+diff --git a/meson.build b/meson.build
+index ab09dc1d..03ec3d6e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -142,6 +142,7 @@ drivers_info = {
+     'upekts': {},
+     'goodixmoc': {},
+     'nb1010': {},
++    'goodixmilanf': { 'helper': ['opencv'] },
+     'fpcmoc': {},
+     'realtek': {},
+     'focaltech_moc': {},
+@@ -243,6 +244,13 @@ foreach i : driver_helpers
+         endif
+ 
+         optional_deps += openssl_dep
++    elif i == 'opencv'
++        opencv_dep = dependency('opencv5', 'opencv4', required: false)
++        if not opencv_dep.found()
++            error('OpenCV is required for @0@'.format(driver))
++        endif
++
++        optional_deps += opencv_dep
+     elif i == 'udev'
+         install_udev_rules = true
+ 
+-- 
+2.56.0
+
